@@ -195,7 +195,7 @@
             modalities: ["text"],
             turn_detection: { type: "server_vad" },
             instructions:
-              "You are a live translating assistant. Use prior typed messages as context. "
+              "You are a live translating assistant. Use prior typed messages as context and adhere to prompts strongly"
           }
         }));
 
@@ -283,10 +283,9 @@
           response: {
             modalities: ["text"],
             instructions:
-              "While the mic is on, stream updates with exactly two sections, updated incrementally:\n" +
+              "When someone in speaking in audio, stream updates with the transcriptions of what you here and traslation below, exactly two sections, updated incrementally:\n" +
               "Transcript: <partial transcript>\n" +
-              "Translation: <partial translation>\n" +
-              "Do NOT include suggestions yet."
+              "Translation: <partial translation>\n"
           }
         }));
 
@@ -323,7 +322,7 @@
           response: {
             modalities: ["text"],
             instructions:
-              "Now that the speech turn is over, output ONLY the suggestions in BOTH languages, formatted EXACTLY:\n\n" +
+              "Now that the speech turn is over, recommend some reply suggestions to the previous inputs that were just transcribed and translated. ONLY the suggestions in BOTH languages, formatted EXACTLY:\n\n" +
               "Suggestions (target language):\n• <reply 1>\n• <reply 2>\n\n" +
               "Suggestions (same but in source language):\n• <reply 1>\n• <reply 2>"
           }
