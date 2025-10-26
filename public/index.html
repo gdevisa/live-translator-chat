@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Live Translator (Agents SDK handoff + context/lang fix)</title>
+  <title>Live Translator (shared history + realtime finals)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { --bg:#fff; --fg:#111; --muted:#777; --bubble:#f7f7f7; --bubbleMe:#eaf1ff; }
@@ -26,7 +26,7 @@
     <div id="chat"></div>
 
     <div class="row">
-      <input id="text" placeholder="Type context or chat (e.g., 'I’m speaking Russian, translate to English.')" />
+      <input id="text" placeholder="Type chat/context (becomes conversation history)" />
       <button id="send">Send</button>
       <button id="mic">Start Mic</button>
     </div>
@@ -43,32 +43,34 @@
     const micBtn = document.getElementById("mic");
     const statusEl = document.getElementById("status");
 
+    // ---- Single source of truth: chat memory ----
+    const history = []; // [{role: "user"|"assistant", content: string}]
+
+    // ---- WebRTC / Realtime state ----
     let pc, dc;
     let sessionOpen = false;
     let connecting = null;
 
-    // Realtime mic state
     let micActive = false;
     let audioTransceiver = null;
     let silentTrack = null;
     let micStream = null;
 
-    // Conversation state (used for /api/chat and /api/mic-stop)
-    const history = [];      // [{role:'user'|'assistant', content: string}]
-    let sessionContext = ""; // accumulated typed context
-    let sourceLang = "";     // e.g., "ru"
-    let targetLang = "";     // e.g., "en"
-
-    // Response tracking
     let currentResponseId = null;
     let awaitingAssistant = false;
 
-    // Live transcript accumulation per mic turn
+    // Live mic buffers
     let liveTranscript = "";
     let micGuardArmed = false;
     let micBuffer = "";
     let ignoreDeltas = false;
 
+    // Finals to commit on Stop
+    let finalTranscriptText = "";
+    let finalTranslationText = "";
+    let currentSection = null; // "transcript" | "translation" | null
+
+    // ---------- UI helpers ----------
     function addBubble(role, text, replaceLast=false) {
       if (replaceLast) {
         const last = chatEl.lastElementChild;
@@ -91,6 +93,7 @@
       return els.at(-1) || null;
     }
 
+    // ---------- Audio helpers ----------
     function makeSilentTrack() {
       const AC = window.AudioContext || window.webkitAudioContext;
       const ac = new AC();
@@ -101,6 +104,7 @@
       return dst.stream.getAudioTracks()[0];
     }
 
+    // ---------- DataChannel guards ----------
     function waitForDCOpen(channel, timeoutMs=10000) {
       return new Promise((resolve, reject) => {
         if (channel && channel.readyState === "open") return resolve();
@@ -116,6 +120,7 @@
       });
     }
 
+    // ---------- SDP exchange ----------
     async function negotiate() {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -129,6 +134,7 @@
       await pc.setRemoteDescription(answer);
     }
 
+    // ---------- Connect / setup Realtime ----------
     async function ensureConnection() {
       if (sessionOpen && dc && dc.readyState === "open") return;
       if (connecting) { await connecting; return; }
@@ -159,32 +165,56 @@
               last.textContent += delta; chatEl.scrollTop = chatEl.scrollHeight;
 
               if (micActive) {
-                // Accumulate transcript only; don't write to history here
-                if (/Transcript:/i.test(delta)) {
-                  const cleaned = delta.replace(/^\s*Transcript:\s*/i, "");
-                  liveTranscript += cleaned;
+                // Route streaming text into final buffers; do NOT update history here
+                let chunk = delta;
+
+                const hasTranscriptLabel = /Transcript:/i.test(chunk);
+                const hasTranslationLabel = /Translation:/i.test(chunk);
+
+                if (hasTranscriptLabel && hasTranslationLabel) {
+                  const parts = chunk.split(/(Transcript:|Translation:)/i).filter(Boolean);
+                  for (let i = 0; i < parts.length; i += 2) {
+                    const label = (parts[i] || "").toLowerCase();
+                    const text = parts[i + 1] || "";
+                    if (label.includes("transcript")) {
+                      currentSection = "transcript";
+                      finalTranscriptText += text;
+                    } else if (label.includes("translation")) {
+                      currentSection = "translation";
+                      finalTranslationText += text;
+                    }
+                  }
+                } else if (hasTranscriptLabel) {
+                  currentSection = "transcript";
+                  chunk = chunk.replace(/^\s*Transcript:\s*/i, "");
+                  finalTranscriptText += chunk;
+                } else if (hasTranslationLabel) {
+                  currentSection = "translation";
+                  chunk = chunk.replace(/^\s*Translation:\s*/i, "");
+                  finalTranslationText += chunk;
                 } else {
-                  liveTranscript += delta;
+                  if (currentSection === "transcript") {
+                    finalTranscriptText += chunk;
+                  } else if (currentSection === "translation") {
+                    finalTranslationText += chunk;
+                  } else {
+                    currentSection = "transcript";
+                    finalTranscriptText += chunk;
+                  }
                 }
 
-                // Guard: ensure first tokens belong to Transcript:
+                // Guard: first tokens must start with "Transcript:"
                 if (micGuardArmed) {
                   micBuffer += delta;
                   const sample = micBuffer.trimStart();
                   if (sample.length >= 12) {
                     if (!/^Transcript:/i.test(sample)) {
                       cancelCurrentResponse();
-                      last.textContent = "";
+                      last.textContent = ""; // clear wrong start bubble
                       awaitingAssistant = true;
                       micGuardArmed = true;
                       micBuffer = "";
-                      dc.send(JSON.stringify({
-                        type: "response.create",
-                        response: {
-                          modalities: ["text"],
-                          instructions: buildMicInstructions()
-                        }
-                      }));
+                      reissueMicTurn(); // re-send strict instructions with history
                     } else {
                       micGuardArmed = false;
                     }
@@ -205,7 +235,7 @@
         dc.onclose = () => { sessionOpen = false; };
         dc.onerror = (e) => console.error("[dc] error", e);
 
-        // Add audio transceiver first; bind silent track to avoid renegotiation
+        // Add audio m-line first and bind a silent track (no renegotiation on mic start)
         audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv" });
         silentTrack = makeSilentTrack();
         await audioTransceiver.sender.replaceTrack(silentTrack);
@@ -214,17 +244,20 @@
         await waitForDCOpen(dc);
         sessionOpen = true;
 
-        // Default session behavior (no Transcript/Translation unless told)
+        // Session defaults (no chat during mic turns unless asked)
         dc.send(JSON.stringify({
           type: "session.update",
           session: {
             modalities: ["text"],
             turn_detection: { type: "server_vad" },
             instructions:
-              "You are a helpful assistant. Only produce Transcript/Translation when explicitly instructed for a mic turn. " +
-              "For normal text chat, provide a concise reply. Never include 'Transcript' or 'Translation' in normal chat."
+              "You are a helpful assistant. Use the conversation memory in this session. " +
+              "During mic turns, only produce Transcript:/Translation: as instructed."
           }
         }));
+
+        // Push existing chat history into Realtime conversation memory
+        await syncHistoryToRealtime();
 
         statusEl.textContent = "Connected.";
       })();
@@ -240,31 +273,64 @@
       currentResponseId = null;
     }
 
-    // ===== Context helpers =====
-    function appendContext(msg) {
-      sessionContext += (sessionContext ? "\n" : "") + msg;
+    // ---------- Realtime conversation sync (memory mirroring) ----------
+    async function syncHistoryToRealtime() {
+      if (!dc || dc.readyState !== "open") return;
+      try {
+        for (const m of history) {
+          dc.send(JSON.stringify({
+            type: "conversation.item.create",
+            item: {
+              type: "message",
+              role: m.role,
+              content: [{ type: "input_text", text: m.content }]
+            }
+          }));
+        }
+        dc.send(JSON.stringify({ type: "conversation.item.commit" }));
+      } catch (e) { console.error("[syncHistoryToRealtime] error", e); }
+    }
+    function appendItemToRealtime(role, text) {
+      if (!dc || dc.readyState !== "open") return;
+      try {
+        dc.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: { type: "message", role, content: [{ type: "input_text", text }] }
+        }));
+        dc.send(JSON.stringify({ type: "conversation.item.commit" }));
+      } catch (e) { console.error("[appendItemToRealtime] error", e); }
     }
 
-    function buildMicInstructions() {
-      const ctx = sessionContext.trim();
-      const langLine = (sourceLang || targetLang)
-        ? `Source language: ${sourceLang || "unknown"}; Target language: ${targetLang || "unknown"}.\n`
-        : "";
-      return (
-        "MIC TURN.\n" +
-        (ctx ? `Context:\n${ctx}\n` : "") +
-        langLine +
-        "Rules:\n" +
-        "• Output NOTHING until speech is detected.\n" +
-        "• When speech is detected, stream ONLY:\n" +
-        "  Transcript: <partial transcript>\n" +
-        "  Translation: <partial translation>\n" +
-        "• NEVER output generic chat during a mic turn.\n" +
-        "• Do NOT include suggestions; those happen after mic stops."
-      );
+    // ---------- TranscribeAgent instructions (runtime) ----------
+    function buildTranscribeInstructions(h = []) {
+      const TRANSCRIBE_INSTRUCTIONS = [
+        "You are a TranscribeAgent responsible for real-time speech recognition and translation.",
+        "Use the ongoing conversation memory already shared with you.",
+        "During a mic turn:",
+        "• Output NOTHING until speech is detected.",
+        "• While speech is detected, stream ONLY:",
+        "  Transcript: <partial transcript>",
+        "  Translation: <partial translation>",
+        "• NEVER output general chat or commentary.",
+        "• Do NOT output suggestions. Those will be requested after the mic stops."
+      ].join("\n");
+
+      if (!Array.isArray(h) || !h.length) return TRANSCRIBE_INSTRUCTIONS;
+
+      const lastFew = h.slice(-6);
+      const formatted = lastFew.map(m => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
+      return `You have the following prior conversation context:\n${formatted}\n\n${TRANSCRIBE_INSTRUCTIONS}`;
     }
 
-    // ===== Typed chat via /api/chat =====
+    async function reissueMicTurn() {
+      const micInstructions = buildTranscribeInstructions(history);
+      dc.send(JSON.stringify({
+        type: "response.create",
+        response: { modalities: ["text"], instructions: micInstructions }
+      }));
+    }
+
+    // ---------- Typed chat flow ----------
     sendBtn.onclick = async () => {
       const msg = textEl.value.trim();
       if (!msg) return;
@@ -272,7 +338,7 @@
 
       addBubble("user", msg);
       history.push({ role: "user", content: msg });
-      appendContext(msg); // keep typed context for mic turns & suggestions
+      appendItemToRealtime("user", msg); // keep Realtime memory aligned
 
       textEl.value = ""; statusEl.textContent = "Thinking…";
       try {
@@ -285,13 +351,14 @@
         const reply = data.text || "(empty)";
         addBubble("assistant", reply);
         history.push({ role: "assistant", content: reply });
+        appendItemToRealtime("assistant", reply); // align Realtime memory
         statusEl.textContent = "Ready.";
       } catch (e) {
         console.error(e); addBubble("assistant", "(chat error)"); statusEl.textContent = "Error.";
       }
     };
 
-    // ===== Mic (Realtime) =====
+    // ---------- Mic (Realtime) ----------
     micBtn.onclick = () => micActive ? stopMic(false) : startMic();
 
     async function startMic() {
@@ -300,24 +367,25 @@
         await ensureConnection();
         ignoreDeltas = false;
 
+        // Make sure Realtime has the latest chat memory
+        await syncHistoryToRealtime();
+
         micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         const micTrack = micStream.getTracks()[0];
-
-        // Swap silent -> mic (no renegotiation)
         await audioTransceiver.sender.replaceTrack(micTrack);
-        micActive = true; liveTranscript = ""; micGuardArmed = true; micBuffer = "";
+
+        micActive = true;
+        liveTranscript = "";
+        finalTranscriptText = "";
+        finalTranslationText = "";
+        currentSection = null;
+        micGuardArmed = true;
+        micBuffer = "";
 
         await waitForDCOpen(dc);
 
-        // Include context + language hints in instructions for this mic turn
         awaitingAssistant = true;
-        dc.send(JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["text"],
-            instructions: buildMicInstructions()
-          }
-        }));
+        await reissueMicTurn(); // strict mic turn with shared history
 
         micBtn.textContent = "Stop Mic"; statusEl.textContent = "🎙️ Mic ON — streaming…";
       } catch (e) {
@@ -339,15 +407,29 @@
       statusEl.textContent = quiet ? "Mic paused for chat." : "Mic OFF — getting suggestions…";
       if (quiet) return;
 
+      // === Commit finals to shared history before suggestions ===
+      const committedTranscript = (finalTranscriptText || "").trim();
+      const committedTranslation = (finalTranslationText || "").trim();
+
+      if (committedTranscript) {
+        const userMsg = `🎙️ Transcript: ${committedTranscript}`;
+        history.push({ role: "user", content: userMsg });
+        appendItemToRealtime("user", userMsg);
+      }
+      if (committedTranslation) {
+        const assistantMsg = `🗣️ Translation: ${committedTranslation}`;
+        history.push({ role: "assistant", content: assistantMsg });
+        appendItemToRealtime("assistant", assistantMsg);
+      }
+
       try {
         const r = await fetch("/api/mic-stop", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            transcript: liveTranscript.trim(),
-            history,
-            source_lang: sourceLang || undefined,
-            target_lang: targetLang || undefined
+            transcript: committedTranscript,
+            translation: committedTranslation, // optional but useful
+            history
           })
         });
         const data = await r.json();
@@ -355,15 +437,15 @@
 
         addBubble("assistant", suggestions);
         history.push({ role: "assistant", content: suggestions });
+        appendItemToRealtime("assistant", suggestions);
 
         statusEl.textContent = "Ready.";
       } catch (e) {
-        console.error(e); addBubble("assistant", "(suggestions error)"); statusEl.textContent = "Error.";
+        console.error(e);
+        addBubble("assistant", "(suggestions error)");
+        statusEl.textContent = "Error.";
       }
     }
-
-    // OPTIONAL: Lock languages here if you want:
-    // sourceLang = "ru"; targetLang = "en";
   </script>
 </body>
 </html>
