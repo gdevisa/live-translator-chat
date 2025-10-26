@@ -37,8 +37,7 @@
 
     <div id="status">Ready.</div>
     <p class="small">
-      Type a message to set context (model replies).<br/>
-      Start Mic → live <em>Transcript</em>/<em>Translation</em>. Stop Mic → <b>Suggestions</b> (target &amp; source).
+      Chat for normal responses. Start Mic for live <em>Transcript</em>/<em>Translation</em>. Stop Mic for <b>Suggestions</b>.
     </p>
   </div>
 
@@ -64,7 +63,8 @@
     let connecting = null;       // prevent double connects
 
     const pendingContext = [];   // messages queued pre-DC-open
-    let awaitingAssistant = false; // start a new bubble on next response
+    let awaitingAssistant = false;     // start a new bubble on next response
+    let currentResponseId = null;      // track the active response to cancel if switching modes
 
     // ===== UI helpers =====
     function addBubble(role, msg, replaceLast=false) {
@@ -122,7 +122,6 @@
     function makeSilentTrack() {
       const ac = new (window.AudioContext || window.webkitAudioContext)();
       const dst = ac.createMediaStreamDestination();
-      // Create inaudible constant signal
       const osc = ac.createOscillator();
       osc.frequency.value = 0;
       const gain = ac.createGain();
@@ -147,9 +146,10 @@
         dc.onmessage = (e) => {
           try {
             const ev = JSON.parse(e.data);
-            // New response started → pre-create a fresh bubble
+            // Track response IDs so we can cancel if needed
             if (ev.type === "response.created" || ev.type === "response.started") {
-              addBubble("assistant", ""); // fresh bubble
+              currentResponseId = ev.response?.id || ev.response_id || null;
+              addBubble("assistant", ""); // fresh bubble for this response
               awaitingAssistant = false;
               return;
             }
@@ -161,6 +161,10 @@
               }
               last.textContent += ev.delta || "";
               chat.scrollTop = chat.scrollHeight;
+              return;
+            }
+            if (ev.type === "response.completed" || ev.type === "response.done") {
+              currentResponseId = null;
               return;
             }
           } catch (err) {
@@ -188,20 +192,16 @@
         sessionOpen = true;
         console.log("[dc] open");
 
-        // Session-wide behavior
+        // Session-wide behavior (general; response-specific instructions will override)
         dc.send(JSON.stringify({
           type: "session.update",
           session: {
             modalities: ["text"],
             turn_detection: { type: "server_vad" },
             instructions:
-              "You are a live translating assistant. Use prior typed messages as context. " +
-              "When the mic is ON, continuously stream ONLY:\n" +
-              "Transcript: <partial transcript>\n" +
-              "Translation: <partial translation>\n\n" +
-              "When the mic is OFF and I ask, output ONLY the suggestions in BOTH languages (target first, then source), exactly:\n\n" +
-              "Suggestions (target):\n• …\n• …\n\n" +
-              "Suggestions (source):\n• …\n• …"
+              "You are a helpful assistant that can also perform live translation during mic turns. " +
+              "Only produce Transcript/Translation when explicitly instructed for a mic turn. " +
+              "For normal text chat, respond as a regular assistant using prior context."
           }
         }));
 
@@ -229,10 +229,27 @@
       return connecting;
     }
 
-    // ===== Text chat (context + normal Q/A) =====
+    function cancelCurrentResponse() {
+      if (!dc || dc.readyState !== "open") return;
+      if (!currentResponseId) return;
+      try {
+        dc.send(JSON.stringify({
+          type: "response.cancel",
+          response: { id: currentResponseId }
+        }));
+      } catch {}
+      currentResponseId = null;
+    }
+
+    // ===== Text chat (normal Q/A) =====
     sendBtn.onclick = async () => {
       const msg = text.value.trim();
       if (!msg) return;
+
+      // If mic is on, quietly stop it first (no suggestions) to avoid mixed streams
+      if (micActive) {
+        await stopMic(true);
+      }
 
       addBubble("user", msg);
       text.value = "";
@@ -254,16 +271,23 @@
         }));
       }
 
-      // Ask model to reply to this text turn (new bubble)
+      // Cancel any live response left over, then request a normal chat reply
+      cancelCurrentResponse();
       awaitingAssistant = true;
       dc.send(JSON.stringify({
         type: "response.create",
-        response: { modalities: ["text"] }
+        response: {
+          modalities: ["text"],
+          // IMPORTANT: force normal assistant behaviour for text chat
+          instructions:
+            "Provide a helpful, concise assistant reply to the user's last message. " +
+            "Do NOT output 'Transcript' or 'Translation' sections for this text turn."
+        }
       }));
     };
 
     // ===== Mic controls (no renegotiation; swap tracks) =====
-    micBtn.onclick = () => micActive ? stopMic() : startMic();
+    micBtn.onclick = () => micActive ? stopMic(false) : startMic();
 
     async function startMic() {
       micBtn.disabled = true;
@@ -278,6 +302,9 @@
           throw new Error("Audio transceiver not ready.");
         }
 
+        // Cancel any existing response to avoid interleaving
+        cancelCurrentResponse();
+
         // SILENT -> MIC (no renegotiation)
         await audioTransceiver.sender.replaceTrack(micTrack);
         micActive = true;
@@ -289,7 +316,7 @@
           response: {
             modalities: ["text"],
             instructions:
-              "While the mic is on, stream updates with exactly two sections, updated incrementally:\n" +
+              "You are in a MIC TURN. Stream updates with exactly two sections, updated incrementally:\n" +
               "Transcript: <partial transcript>\n" +
               "Translation: <partial translation>\n" +
               "Do NOT include suggestions yet."
@@ -309,7 +336,7 @@
       }
     }
 
-    async function stopMic() {
+    async function stopMic(quiet=false) {
       // MIC -> SILENT (no renegotiation)
       try {
         if (audioTransceiver && audioTransceiver.sender) {
@@ -320,16 +347,22 @@
 
       micActive = false;
       micBtn.textContent = "Start Mic";
-      statusEl.textContent = "Mic OFF — requesting suggestions…";
+      statusEl.textContent = quiet ? "Mic paused for chat." : "Mic OFF — requesting suggestions…";
+
+      if (quiet) return; // no suggestions when stopping due to chat send
 
       if (dc && dc.readyState === "open") {
+        // Cancel any leftover streaming response before suggestions
+        cancelCurrentResponse();
+
         addBubble("assistant", ""); // separate bubble for suggestions
+        awaitingAssistant = false;
         dc.send(JSON.stringify({
           type: "response.create",
           response: {
             modalities: ["text"],
             instructions:
-              "Now that the speech turn is over, output ONLY the suggestions in BOTH languages, formatted EXACTLY:\n\n" +
+              "Mic turn ended. Output ONLY the suggestions in BOTH languages, formatted EXACTLY:\n\n" +
               "Suggestions (target):\n• <short reply 1>\n• <short reply 2>\n\n" +
               "Suggestions (source):\n• <short reply 1>\n• <short reply 2>"
           }
