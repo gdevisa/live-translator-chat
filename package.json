@@ -1,9 +1,9 @@
-
 {
-  "name": "realtime-agents-handoff",
+  "name": "live-translator-chat",
   "private": true,
   "type": "module",
   "dependencies": {
-    "@openai/agents": "^0.1.0"
+    "@openai/agents": "^0.1.0",
+    "zod": "^3.23.8"
   }
 }
