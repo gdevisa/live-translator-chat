@@ -140,23 +140,15 @@
       dc.onmessage = (e) => {
         try {
           const ev = JSON.parse(e.data);
-          // Debug:
-          // console.log("[dc] event:", ev.type, ev);
-
           // Streaming text deltas (names differ across versions)
           if (ev.type === "response.output_text.delta" || ev.type === "response.text.delta") {
             let last = latestAssistantBubble();
             if (!last) last = addBubble("assistant", "");
-
-            // When mic is ON, we expect the two labeled sections
-            // The model is instructed to produce those, so we just append deltas.
             last.textContent += ev.delta || "";
             chat.scrollTop = chat.scrollHeight;
             return;
           }
-
           if (ev.type === "response.completed" || ev.type === "response.done") {
-            // A single response finished streaming (we may start another later)
             return;
           }
         } catch (err) {
@@ -169,7 +161,12 @@
         statusEl.textContent = "State: " + pc.connectionState;
       };
 
-      // Create SDP offer *without* mic track (pure chat session for now)
+      // IMPORTANT: Advertise an audio m-line BEFORE creating the offer,
+      // so the very first SDP has an audio media section (fixes 400 invalid_offer).
+      pc.addTransceiver("audio", { direction: "sendrecv" });
+      // If your browser ever objects, you can use: { direction: "recvonly" }
+
+      // Create SDP offer (now includes audio) and do the handshake
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       const resp = await fetch(`/api/realtime?model=${MODEL}`, {
@@ -241,7 +238,7 @@
         micActive = true;
 
         // Start a streaming response for the live turn:
-        // We explicitly ask the model to stream only Transcript / Translation sections.
+        // Stream only Transcript / Translation sections.
         dc.send(JSON.stringify({
           type: "response.create",
           response: {
@@ -273,11 +270,9 @@
       micBtn.textContent = "Start Mic";
       statusEl.textContent = "Mic OFF — requesting suggestions…";
 
-      // Ask ONLY for suggestions (new message)
+      // Ask ONLY for suggestions (new assistant message)
       if (dc && dc.readyState === "open") {
-        // Create a fresh assistant bubble for suggestions (clean separation)
-        addBubble("assistant", "");
-
+        addBubble("assistant", ""); // separate bubble for suggestions
         dc.send(JSON.stringify({
           type: "response.create",
           response: {
