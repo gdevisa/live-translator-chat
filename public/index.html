@@ -37,7 +37,8 @@
 
     <div id="status">Ready.</div>
     <p class="small">
-      Chat → normal replies. Start Mic → live <em>Transcript</em>/<em>Translation</em>. Stop Mic → <b>Suggestions</b>.
+      Type a message to set context (model replies).<br/>
+      Start Mic → live <em>Transcript</em>/<em>Translation</em>. Stop Mic → <b>Suggestions</b> (target &amp; source).
     </p>
   </div>
 
@@ -63,10 +64,7 @@
     let connecting = null;       // prevent double connects
 
     const pendingContext = [];   // messages queued pre-DC-open
-    let awaitingAssistant = false;     // start a new bubble on next response
-    let currentResponseId = null;      // track active response
-    let micGuardArmed = false;         // guard against generic replies during mic turn
-    let micBuffer = "";                // collects first few deltas to validate format
+    let awaitingAssistant = false; // start a new bubble on next response
 
     // ===== UI helpers =====
     function addBubble(role, msg, replaceLast=false) {
@@ -122,9 +120,9 @@
     }
 
     function makeSilentTrack() {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      const ac = new AC();
+      const ac = new (window.AudioContext || window.webkitAudioContext)();
       const dst = ac.createMediaStreamDestination();
+      // Create inaudible constant signal
       const osc = ac.createOscillator();
       osc.frequency.value = 0;
       const gain = ac.createGain();
@@ -149,79 +147,26 @@
         dc.onmessage = (e) => {
           try {
             const ev = JSON.parse(e.data);
+            // New response started → pre-create a fresh bubble
             if (ev.type === "response.created" || ev.type === "response.started") {
-              currentResponseId = ev.response?.id || ev.response_id || null;
-              // new response → new assistant bubble
-              addBubble("assistant", "");
+              addBubble("assistant", ""); // fresh bubble
               awaitingAssistant = false;
-              // reset mic buffer whenever a response starts
-              if (micActive) {
-                micGuardArmed = true;
-                micBuffer = "";
-              }
               return;
             }
-
             if (ev.type === "response.output_text.delta" || ev.type === "response.text.delta") {
               let last = latestAssistantBubble();
               if (awaitingAssistant || !last) {
                 last = addBubble("assistant", "");
                 awaitingAssistant = false;
               }
-
-              const delta = ev.delta || "";
-              last.textContent += delta;
+              last.textContent += ev.delta || "";
               chat.scrollTop = chat.scrollHeight;
-
-              // ===== Mic-turn guard: ensure the FIRST content starts with "Transcript:" =====
-              if (micActive && micGuardArmed) {
-                micBuffer += delta;
-                const sample = micBuffer.trimStart();
-                // If we've got enough characters to decide and it's NOT starting with "Transcript:",
-                // cancel and re-issue with stricter instruction.
-                if (sample.length >= 12) {
-                  if (!/^Transcript:/i.test(sample)) {
-                    console.warn("[guard] Mic turn started producing generic text. Cancelling & re-issuing mic instructions.");
-                    cancelCurrentResponse();
-                    // Replace current bubble text with a clean header to avoid leftover generic text.
-                    last.textContent = "";
-                    // Re-issue strict mic response
-                    awaitingAssistant = true;
-                    micGuardArmed = true;
-                    micBuffer = "";
-                    dc.send(JSON.stringify({
-                      type: "response.create",
-                      response: {
-                        modalities: ["text"],
-                        instructions:
-                          "MIC TURN STRICT MODE.\n" +
-                          "Rules:\n" +
-                          "1) Do NOT output anything until speech is detected from the WebRTC audio.\n" +
-                          "2) When speech is detected, output ONLY two sections and nothing else:\n" +
-                          "Transcript: <partial transcript>\n" +
-                          "Translation: <partial translation>\n" +
-                          "3) NEVER produce general chat text or greetings during a mic turn.\n" +
-                          "4) Do not repeat suggestions; suggestions come only after mic stops."
-                      }
-                    }));
-                  } else {
-                    // We got Transcript: — disarm the guard
-                    micGuardArmed = false;
-                  }
-                }
-              }
-              return;
-            }
-
-            if (ev.type === "response.completed" || ev.type === "response.done") {
-              currentResponseId = null;
               return;
             }
           } catch (err) {
             console.error("[dc] parse error", err, e.data);
           }
         };
-
         dc.onclose = () => { console.log("[dc] close"); sessionOpen = false; };
         dc.onerror = (e) => console.error("[dc] error", e);
 
@@ -243,16 +188,14 @@
         sessionOpen = true;
         console.log("[dc] open");
 
-        // Session-wide behavior (default: act like normal assistant; mic turns are opt-in)
+        // Session-wide behavior
         dc.send(JSON.stringify({
           type: "session.update",
           session: {
             modalities: ["text"],
             turn_detection: { type: "server_vad" },
             instructions:
-              "You are a helpful assistant for chat. " +
-              "Only produce Transcript/Translation when explicitly instructed for a mic turn. " +
-              "For normal text chat, provide a concise helpful reply, and NEVER include 'Transcript' or 'Translation'."
+              "You are a live translating assistant. Use prior typed messages as context. "
           }
         }));
 
@@ -280,27 +223,10 @@
       return connecting;
     }
 
-    function cancelCurrentResponse() {
-      if (!dc || dc.readyState !== "open") return;
-      if (!currentResponseId) return;
-      try {
-        dc.send(JSON.stringify({
-          type: "response.cancel",
-          response: { id: currentResponseId }
-        }));
-      } catch {}
-      currentResponseId = null;
-    }
-
-    // ===== Text chat (normal Q/A) =====
+    // ===== Text chat (context + normal Q/A) =====
     sendBtn.onclick = async () => {
       const msg = text.value.trim();
       if (!msg) return;
-
-      // If mic is on, quietly stop it first (no suggestions) to avoid mixed streams
-      if (micActive) {
-        await stopMic(true);
-      }
 
       addBubble("user", msg);
       text.value = "";
@@ -322,23 +248,16 @@
         }));
       }
 
-      // Cancel any live response left over, then request a normal chat reply
-      cancelCurrentResponse();
+      // Ask model to reply to this text turn (new bubble)
       awaitingAssistant = true;
       dc.send(JSON.stringify({
         type: "response.create",
-        response: {
-          modalities: ["text"],
-          // Force normal chat behavior for this turn
-          instructions:
-            "Provide a helpful, concise assistant reply to the last user message. " +
-            "Do NOT include 'Transcript' or 'Translation' in this text turn."
-        }
+        response: { modalities: ["text"] }
       }));
     };
 
     // ===== Mic controls (no renegotiation; swap tracks) =====
-    micBtn.onclick = () => micActive ? stopMic(false) : startMic();
+    micBtn.onclick = () => micActive ? stopMic() : startMic();
 
     async function startMic() {
       micBtn.disabled = true;
@@ -353,14 +272,9 @@
           throw new Error("Audio transceiver not ready.");
         }
 
-        // Cancel any existing response to avoid interleaving
-        cancelCurrentResponse();
-
         // SILENT -> MIC (no renegotiation)
         await audioTransceiver.sender.replaceTrack(micTrack);
         micActive = true;
-        micGuardArmed = true;
-        micBuffer = "";
 
         // Start a live streaming response (single growing bubble)
         awaitingAssistant = true;
@@ -369,12 +283,10 @@
           response: {
             modalities: ["text"],
             instructions:
-              "MIC TURN.\n" +
-              "Output NOTHING until speech is detected from WebRTC audio.\n" +
-              "When speech is detected, output ONLY these two sections, streaming as they update:\n" +
+              "While the mic is on, stream updates with exactly two sections, updated incrementally:\n" +
               "Transcript: <partial transcript>\n" +
               "Translation: <partial translation>\n" +
-              "NEVER produce general chat or any other text during a mic turn."
+              "Do NOT include suggestions yet."
           }
         }));
 
@@ -391,7 +303,7 @@
       }
     }
 
-    async function stopMic(quiet=false) {
+    async function stopMic() {
       // MIC -> SILENT (no renegotiation)
       try {
         if (audioTransceiver && audioTransceiver.sender) {
@@ -401,28 +313,19 @@
       try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch {}
 
       micActive = false;
-      micGuardArmed = false;
-      micBuffer = "";
-
       micBtn.textContent = "Start Mic";
-      statusEl.textContent = quiet ? "Mic paused for chat." : "Mic OFF — requesting suggestions…";
-
-      if (quiet) return; // no suggestions when stopping due to chat send
+      statusEl.textContent = "Mic OFF — requesting suggestions…";
 
       if (dc && dc.readyState === "open") {
-        // Cancel any leftover streaming response before suggestions
-        cancelCurrentResponse();
-
         addBubble("assistant", ""); // separate bubble for suggestions
-        awaitingAssistant = false;
         dc.send(JSON.stringify({
           type: "response.create",
           response: {
             modalities: ["text"],
             instructions:
-              "Mic turn ended. Output ONLY the suggestions in BOTH languages, formatted EXACTLY:\n\n" +
-              "Suggestions (target):\n• <short reply 1>\n• <short reply 2>\n\n" +
-              "Suggestions (source):\n• <short reply 1>\n• <short reply 2>"
+              "Now that the speech turn is over, output ONLY the suggestions in BOTH languages, formatted EXACTLY:\n\n" +
+              "Suggestions (target language):\n• <reply 1>\n• <reply 2>\n\n" +
+              "Suggestions (same but in source language):\n• <reply 1>\n• <reply 2>"
           }
         }));
       }
