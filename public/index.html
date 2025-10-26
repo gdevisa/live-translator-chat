@@ -52,15 +52,15 @@
     const micBtn   = document.getElementById("mic");
     const statusEl = document.getElementById("status");
 
-    // ===== RTC / Realtime session state =====
+    // ===== State =====
     let pc, dc, micStream;
     let sessionOpen = false;
     let micActive = false;
+    let audioTransceiver = null; // single audio m-line we reuse
 
-    // Queue of messages typed before the session exists
-    const pendingContext = [];
+    const pendingContext = []; // messages typed before DC open
 
-    // ===== Helpers =====
+    // ===== UI helpers =====
     function addBubble(role, msg, replaceLast=false) {
       if (replaceLast) {
         const last = chat.lastElementChild;
@@ -124,16 +124,17 @@
       if (sessionOpen && dc && dc.readyState === "open") return;
 
       console.log("[rtc] creating RTCPeerConnection");
-      pc = new RTCPeerConnection();
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }] // basic STUN
+      });
 
-      // Data channel
+      // Prepare data channel
       dc = pc.createDataChannel("oai-events");
 
-      // Robust message handler (deltas + completion)
+      // Text streaming handler
       dc.onmessage = (e) => {
         try {
           const ev = JSON.parse(e.data);
-          // console.log("[dc] event:", ev.type);
           if (ev.type === "response.output_text.delta" || ev.type === "response.text.delta") {
             let last = latestAssistantBubble();
             if (!last) last = addBubble("assistant", "");
@@ -154,36 +155,37 @@
         statusEl.textContent = "State: " + pc.connectionState;
       };
 
-      // IMPORTANT: Ensure the offer has an audio m-line up front
-      pc.addTransceiver("audio", { direction: "sendrecv" }); // or "recvonly" if needed
+      // Create ONE audio transceiver so initial SDP has an audio m-line
+      audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv" });
 
-      // First negotiation (no mic track yet)
+      // First negotiation (no mic bound yet)
       await negotiateWithServer();
 
-      // Wait until the data channel truly opens before sending anything
+      // Wait for DC open before sending anything
       await waitForDataChannelOpen(dc);
       sessionOpen = true;
       console.log("[dc] open");
 
-      // Session instructions: how to behave overall
+      // Session-wide instructions
       dc.send(JSON.stringify({
         type: "session.update",
         session: {
           modalities: ["text"],
+          // server-side VAD helps detect speech turns
           turn_detection: { type: "server_vad" },
           instructions:
             "You are a live translating assistant. Use prior typed messages as context. " +
-            "When the mic is ON, continuously stream ONLY the following two sections, updating them as new audio arrives:\n" +
+            "When the mic is ON, continuously stream ONLY the following two sections, updated as audio arrives:\n" +
             "Transcript: <partial transcript>\n" +
             "Translation: <partial translation>\n\n" +
             "When the mic is OFF and I ask, output ONLY the suggestions in BOTH languages (target first, then source), " +
-            "formatted as:\n\n" +
+            "formatted exactly as:\n\n" +
             "Suggestions (target):\n• …\n• …\n\n" +
             "Suggestions (source):\n• …\n• …"
         }
       }));
 
-      // Replay visible chat (context)
+      // Replay visible chat as context for the session
       const items = Array.from(chat.children).map(el => {
         const role = (el.dataset.role === "me") ? "user" : "assistant";
         const t = el.textContent || "";
@@ -193,7 +195,7 @@
         dc.send(JSON.stringify({ type: "conversation.item.create", item: it }));
       }
 
-      // Flush any queued context typed before connection
+      // Flush any queued pre-open messages
       for (const msg of pendingContext.splice(0)) {
         dc.send(JSON.stringify({
           type: "conversation.item.create",
@@ -201,7 +203,6 @@
         }));
       }
 
-      console.log("[rtc] WebRTC data channel established");
       statusEl.textContent = "Connected. You can chat or start mic.";
     }
 
@@ -224,41 +225,39 @@
           return;
         }
       } else {
-        // Connected: push immediately
         dc.send(JSON.stringify({
           type: "conversation.item.create",
           item: { type:"message", role:"user", content:[{ type:"input_text", text: msg }] }
         }));
       }
 
-      // Ask model to reply to the text turn
+      // Ask model to reply to this text turn
       dc.send(JSON.stringify({
         type: "response.create",
         response: { modalities: ["text"] }
       }));
     };
 
-    // ===== Mic: start/stop live translation =====
+    // ===== Mic controls (streaming) =====
     micBtn.onclick = () => micActive ? stopMic() : startMic();
 
     async function startMic() {
       micBtn.disabled = true;
       statusEl.textContent = "Starting mic…";
       try {
-        // Ensure connection & data channel are ready
-        await ensureConnection();
+        await ensureConnection(); // DC must be open
 
-        // Grab mic and add track
+        // Get mic and bind to existing transceiver (keeps single m-line)
         micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const track = micStream.getTracks()[0];
-        pc.addTrack(track, micStream);
+        const micTrack = micStream.getTracks()[0];
+        await audioTransceiver.sender.replaceTrack(micTrack);
 
-        // **Renegotiate** so the server starts receiving our audio
+        // Renegotiate so server starts receiving our audio
         await negotiateWithServer();
 
         micActive = true;
 
-        // Start a streaming response for the live turn (Transcript/Translation only)
+        // Kick off streaming Transcript/Translation
         dc.send(JSON.stringify({
           type: "response.create",
           response: {
@@ -285,13 +284,20 @@
     }
 
     async function stopMic() {
+      // Unbind track to stop sending audio (keep session alive)
+      try {
+        if (audioTransceiver && audioTransceiver.sender) {
+          await audioTransceiver.sender.replaceTrack(null);
+        }
+      } catch {}
       try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch {}
+
       micActive = false;
       micBtn.textContent = "Start Mic";
       statusEl.textContent = "Mic OFF — requesting suggestions…";
 
       if (dc && dc.readyState === "open") {
-        // Separate bubble for suggestions (clear separation)
+        // Separate bubble for suggestions
         addBubble("assistant", "");
         dc.send(JSON.stringify({
           type: "response.create",
