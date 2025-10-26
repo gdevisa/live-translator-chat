@@ -1,11 +1,14 @@
 {
-  "framework": null,
   "builds": [
-    { "src": "api/realtime.js", "use": "@vercel/node" },
+    { "src": "api/realtime-sdp.mjs", "use": "@vercel/node" },
+    { "src": "api/chat.mjs", "use": "@vercel/node" },
+    { "src": "api/mic-stop.mjs", "use": "@vercel/node" },
     { "src": "public/**", "use": "@vercel/static" }
   ],
   "routes": [
-    { "src": "/api/realtime", "dest": "/api/realtime.js" },
+    { "src": "/api/realtime-sdp", "dest": "/api/realtime-sdp.mjs" },
+    { "src": "/api/chat", "dest": "/api/chat.mjs" },
+    { "src": "/api/mic-stop", "dest": "/api/mic-stop.mjs" },
     { "src": "/(.*)", "dest": "/public/$1" }
   ]
 }

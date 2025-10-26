@@ -1,0 +1,9 @@
+
+{
+  "name": "realtime-agents-handoff",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@openai/agents": "^0.1.0"
+  }
+}

@@ -2,13 +2,12 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Live Translator Chat</title>
+  <title>Live Translator (Agents SDK handoff)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { --bg:#fff; --fg:#111; --muted:#777; --bubble:#f7f7f7; --bubbleMe:#eaf1ff; }
     body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--fg); }
     .wrap { max-width: 880px; margin: 0 auto; padding: 24px; }
-    h2 { margin: 0 0 12px; }
     #chat { border:1px solid #ddd; border-radius:12px; padding:14px; min-height:380px; display:flex; flex-direction:column; gap:8px; overflow:auto; }
     .bubble { padding:10px 12px; border-radius:12px; max-width:80%; white-space:pre-wrap; line-height:1.35; }
     .me { align-self:flex-end; background:var(--bubbleMe); }
@@ -16,16 +15,13 @@
     .row { display:flex; gap:10px; margin-top:12px; }
     #text { flex:1; padding:10px; border:1px solid #ccc; border-radius:10px; font-size:15px; }
     button { padding:10px 14px; border:1px solid #ccc; border-radius:10px; background:#fff; cursor:pointer; font-size:15px; }
-    button:active { transform: translateY(1px); }
     #status { margin-top:10px; color:var(--muted); font-size:13px; }
-    .small { font-size:12px; color:var(--muted); }
   </style>
-  <!-- Inline favicon to avoid 404 -->
   <link rel="icon" href="data:,">
 </head>
 <body>
   <div class="wrap">
-    <h2>🎧 Live Translator Chat</h2>
+    <h2>🎧 Live Translator (Agents SDK handoff)</h2>
 
     <div id="chat"></div>
 
@@ -36,297 +32,241 @@
     </div>
 
     <div id="status">Ready.</div>
-    <p class="small">
-      Type a message to set context (model replies).<br/>
-      Start Mic → live <em>Transcript</em>/<em>Translation</em>. Stop Mic → <b>Suggestions</b> (target &amp; source).
-    </p>
   </div>
 
   <script>
-    // ===== Config =====
-    const MODEL   = "gpt-4o-realtime-preview";
+    const MODEL = "gpt-4o-realtime-preview";
 
-    // ===== DOM =====
-    const chat     = document.getElementById("chat");
-    const text     = document.getElementById("text");
-    const sendBtn  = document.getElementById("send");
-    const micBtn   = document.getElementById("mic");
+    const chatEl = document.getElementById("chat");
+    const textEl = document.getElementById("text");
+    const sendBtn = document.getElementById("send");
+    const micBtn = document.getElementById("mic");
     const statusEl = document.getElementById("status");
 
-    // ===== State =====
     let pc, dc;
     let sessionOpen = false;
     let micActive = false;
+    let audioTransceiver = null;
+    let silentTrack = null;
+    let micStream = null;
 
-    let audioTransceiver = null; // single m=audio transceiver
-    let silentTrack = null;      // always-bound silent track
-    let micStream = null;        // user mic when active
-    let connecting = null;       // prevent double connects
+    const history = []; // shared message history
+    let currentResponseId = null;
+    let awaitingAssistant = false;
 
-    const pendingContext = [];   // messages queued pre-DC-open
-    let awaitingAssistant = false; // start a new bubble on next response
+    let liveTranscript = "";
+    let micGuardArmed = false;
+    let micBuffer = "";
 
-    // ===== UI helpers =====
-    function addBubble(role, msg, replaceLast=false) {
+    function addBubble(role, text, replaceLast=false) {
       if (replaceLast) {
-        const last = chat.lastElementChild;
+        const last = chatEl.lastElementChild;
         if (last && last.dataset.role === (role === "user" ? "me" : "assistant")) {
-          last.textContent = msg;
-          chat.scrollTop = chat.scrollHeight;
-          return last;
+          last.textContent = text; chatEl.scrollTop = chatEl.scrollHeight; return last;
         }
       }
       const div = document.createElement("div");
       div.className = "bubble " + (role === "user" ? "me" : "ai");
       div.dataset.role = role === "user" ? "me" : "assistant";
-      div.textContent = msg;
-      chat.appendChild(div);
-      chat.scrollTop = chat.scrollHeight;
+      div.textContent = text;
+      chatEl.appendChild(div);
+      chatEl.scrollTop = chatEl.scrollHeight;
       return div;
     }
     function latestAssistantBubble() {
-      const els = Array.from(chat.children).filter(el => el.dataset.role === "assistant");
+      const els = Array.from(chatEl.children).filter(el => el.dataset.role === "assistant");
       return els.at(-1) || null;
     }
-    function waitForDCOpen(channel, timeoutMs=10000) {
-      return new Promise((resolve, reject) => {
-        if (channel && channel.readyState === "open") return resolve();
-        let done = false;
-        const onOpen = () => { if (!done){ done=true; cleanup(); resolve(); } };
-        const onClose= () => { if (!done){ done=true; cleanup(); reject(new Error("DC closed before open")); } };
-        const onErr = e =>   { if (!done){ done=true; cleanup(); reject(e||new Error("DC error before open")); } };
-        const timer = setTimeout(() => { if (!done){ done=true; cleanup(); reject(new Error("DC open timeout")); } }, timeoutMs);
-        function cleanup(){ clearTimeout(timer); channel.removeEventListener("open",onOpen); channel.removeEventListener("close",onClose); channel.removeEventListener("error",onErr); }
-        channel.addEventListener("open", onOpen, {once:true});
-        channel.addEventListener("close", onClose, {once:true});
-        channel.addEventListener("error", onErr, {once:true});
-      });
+
+    function makeSilentTrack() {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ac = new AC();
+      const dst = ac.createMediaStreamDestination();
+      const osc = ac.createOscillator(); osc.frequency.value = 0;
+      const gain = ac.createGain(); gain.gain.value = 0.00001;
+      osc.connect(gain).connect(dst); osc.start();
+      return dst.stream.getAudioTracks()[0];
     }
 
     async function negotiate() {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      const resp = await fetch(`/api/realtime?model=${MODEL}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/sdp" },
-        body: offer.sdp
+      const resp = await fetch(`/api/realtime-sdp?model=${MODEL}`, {
+        method: "POST", headers: { "Content-Type": "application/sdp" }, body: offer.sdp
       });
-      if (!resp.ok) {
-        const txt = await resp.text();
-        throw new Error(`Proxy /api/realtime failed: ${resp.status} ${txt}`);
-      }
+      if (!resp.ok) throw new Error(await resp.text());
       const answer = { type: "answer", sdp: await resp.text() };
       await pc.setRemoteDescription(answer);
     }
 
-    function makeSilentTrack() {
-      const ac = new (window.AudioContext || window.webkitAudioContext)();
-      const dst = ac.createMediaStreamDestination();
-      // Create inaudible constant signal
-      const osc = ac.createOscillator();
-      osc.frequency.value = 0;
-      const gain = ac.createGain();
-      gain.gain.value = 0.00001;
-      osc.connect(gain).connect(dst);
-      osc.start();
-      return dst.stream.getAudioTracks()[0];
-    }
-
     async function ensureConnection() {
       if (sessionOpen && dc && dc.readyState === "open") return;
-      if (connecting) return connecting;
+      pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
 
-      connecting = (async () => {
-        console.log("[rtc] creating RTCPeerConnection");
-        pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+      dc = pc.createDataChannel("oai-events");
+      dc.onmessage = (e) => {
+        try {
+          const ev = JSON.parse(e.data);
+          if (ev.type === "response.created" || ev.type === "response.started") {
+            currentResponseId = ev.response?.id || ev.response_id || null;
+            addBubble("assistant", "");
+            awaitingAssistant = false;
+            if (micActive) { micGuardArmed = true; micBuffer = ""; }
+            return;
+          }
+          if (ev.type === "response.output_text.delta" || ev.type === "response.text.delta") {
+            let last = latestAssistantBubble();
+            if (awaitingAssistant || !last) { last = addBubble("assistant", ""); awaitingAssistant = false; }
+            const delta = ev.delta || "";
+            last.textContent += delta; chatEl.scrollTop = chatEl.scrollHeight;
 
-        // Data channel
-        dc = pc.createDataChannel("oai-events");
-
-        // Stream handler (supports both delta event names)
-        dc.onmessage = (e) => {
-          try {
-            const ev = JSON.parse(e.data);
-            // New response started → pre-create a fresh bubble
-            if (ev.type === "response.created" || ev.type === "response.started") {
-              addBubble("assistant", ""); // fresh bubble
-              awaitingAssistant = false;
-              return;
-            }
-            if (ev.type === "response.output_text.delta" || ev.type === "response.text.delta") {
-              let last = latestAssistantBubble();
-              if (awaitingAssistant || !last) {
-                last = addBubble("assistant", "");
-                awaitingAssistant = false;
+            if (micActive) {
+              if (/Transcript:/i.test(delta)) {
+                const cleaned = delta.replace(/^\s*Transcript:\s*/i, "");
+                liveTranscript += cleaned;
+              } else {
+                liveTranscript += delta;
               }
-              last.textContent += ev.delta || "";
-              chat.scrollTop = chat.scrollHeight;
-              return;
+              // Guard first tokens start with Transcript:
+              if (micGuardArmed) {
+                micBuffer += delta;
+                const sample = micBuffer.trimStart();
+                if (sample.length >= 12) {
+                  if (!/^Transcript:/i.test(sample)) {
+                    cancelCurrentResponse();
+                    last.textContent = "";
+                    awaitingAssistant = true;
+                    micGuardArmed = true;
+                    micBuffer = "";
+                    dc.send(JSON.stringify({
+                      type: "response.create",
+                      response: {
+                        modalities: ["text"],
+                        instructions:
+                          "MIC TURN STRICT.\n" +
+                          "Output NOTHING until speech is detected.\n" +
+                          "When speech is detected, stream ONLY:\n" +
+                          "Transcript: <partial transcript>\n" +
+                          "Translation: <partial translation>\n" +
+                          "NEVER output generic chat during mic turn."
+                      }
+                    }));
+                  } else {
+                    micGuardArmed = false;
+                  }
+                }
+              }
             }
-          } catch (err) {
-            console.error("[dc] parse error", err, e.data);
+            return;
           }
-        };
-        dc.onclose = () => { console.log("[dc] close"); sessionOpen = false; };
-        dc.onerror = (e) => console.error("[dc] error", e);
-
-        pc.onconnectionstatechange = () => {
-          console.log("[pc] state:", pc.connectionState);
-          statusEl.textContent = "State: " + pc.connectionState;
-        };
-
-        // Single audio transceiver + bind SILENT track from the start (no renegotiation later)
-        audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv" });
-        silentTrack = makeSilentTrack();
-        await audioTransceiver.sender.replaceTrack(silentTrack);
-
-        // One-time negotiation
-        await negotiate();
-
-        // Wait for DC open
-        await waitForDCOpen(dc);
-        sessionOpen = true;
-        console.log("[dc] open");
-
-        // Session-wide behavior
-        dc.send(JSON.stringify({
-          type: "session.update",
-          session: {
-            modalities: ["text"],
-            turn_detection: { type: "server_vad" },
-            instructions:
-              "You are a live translating assistant. Use prior typed messages as context and adhere to prompts strongly"
+          if (ev.type === "response.completed" || ev.type === "response.done") {
+            currentResponseId = null;
+            return;
           }
-        }));
+        } catch (err) { console.error("[dc] parse error", err, e.data); }
+      };
 
-        // Replay visible chat as context
-        const items = Array.from(chat.children).map(el => {
-          const role = (el.dataset.role === "me") ? "user" : "assistant";
-          const t = el.textContent || "";
-          return { type:"message", role, content:[{ type:"output_text", text: t }] };
-        });
-        for (const it of items) {
-          dc.send(JSON.stringify({ type: "conversation.item.create", item: it }));
+      audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv" });
+      silentTrack = makeSilentTrack();
+      await audioTransceiver.sender.replaceTrack(silentTrack);
+
+      await negotiate();
+      sessionOpen = true;
+
+      dc.send(JSON.stringify({
+        type: "session.update",
+        session: {
+          modalities: ["text"],
+          turn_detection: { type: "server_vad" },
+          instructions:
+            "You are a helpful assistant. Only produce Transcript/Translation when explicitly instructed for a mic turn. " +
+            "For normal text chat, provide a concise reply. Never include 'Transcript' or 'Translation' in normal chat."
         }
-
-        // Flush queued context
-        for (const msg of pendingContext.splice(0)) {
-          dc.send(JSON.stringify({
-            type: "conversation.item.create",
-            item: { type:"message", role:"user", content:[{ type:"input_text", text: msg }] }
-          }));
-        }
-
-        statusEl.textContent = "Connected. You can chat or start mic.";
-      })().finally(() => { connecting = null; });
-
-      return connecting;
+      }));
     }
 
-    // ===== Text chat (context + normal Q/A) =====
+    function cancelCurrentResponse() {
+      if (!dc || dc.readyState !== "open") return;
+      if (!currentResponseId) return;
+      try { dc.send(JSON.stringify({ type: "response.cancel", response: { id: currentResponseId } })); } catch {}
+      currentResponseId = null;
+    }
+
+    // Typed chat → Agents SDK (server)
     sendBtn.onclick = async () => {
-      const msg = text.value.trim();
+      const msg = textEl.value.trim();
       if (!msg) return;
+      if (micActive) await stopMic(true);
 
       addBubble("user", msg);
-      text.value = "";
-
-      if (!sessionOpen) {
-        pendingContext.push(msg);
-        try {
-          statusEl.textContent = "Connecting…";
-          await ensureConnection();
-        } catch (err) {
-          console.error(err);
-          statusEl.textContent = "Error: " + String(err);
-          return;
-        }
-      } else {
-        dc.send(JSON.stringify({
-          type: "conversation.item.create",
-          item: { type:"message", role:"user", content:[{ type:"input_text", text: msg }] }
-        }));
+      history.push({ role: "user", content: msg });
+      textEl.value = ""; statusEl.textContent = "Thinking…";
+      try {
+        const r = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: history }) });
+        const data = await r.json();
+        const reply = data.text || "(empty)";
+        addBubble("assistant", reply);
+        history.push({ role: "assistant", content: reply });
+        statusEl.textContent = "Ready.";
+      } catch (e) {
+        console.error(e); addBubble("assistant", "(chat error)"); statusEl.textContent = "Error.";
       }
-
-      // Ask model to reply to this text turn (new bubble)
-      awaitingAssistant = true;
-      dc.send(JSON.stringify({
-        type: "response.create",
-        response: { modalities: ["text"] }
-      }));
     };
 
-    // ===== Mic controls (no renegotiation; swap tracks) =====
-    micBtn.onclick = () => micActive ? stopMic() : startMic();
+    micBtn.onclick = () => micActive ? stopMic(false) : startMic();
 
     async function startMic() {
-      micBtn.disabled = true;
-      statusEl.textContent = "Starting mic…";
+      micBtn.disabled = true; statusEl.textContent = "Starting mic…";
       try {
-        await ensureConnection(); // DC must be open
-
+        await ensureConnection();
         micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         const micTrack = micStream.getTracks()[0];
-
-        if (!audioTransceiver || !audioTransceiver.sender) {
-          throw new Error("Audio transceiver not ready.");
-        }
-
-        // SILENT -> MIC (no renegotiation)
         await audioTransceiver.sender.replaceTrack(micTrack);
-        micActive = true;
-
-        // Start a live streaming response (single growing bubble)
+        micActive = true; liveTranscript = ""; micGuardArmed = true; micBuffer = "";
         awaitingAssistant = true;
+
         dc.send(JSON.stringify({
           type: "response.create",
           response: {
             modalities: ["text"],
             instructions:
-              "When someone in speaking in audio, stream updates with the transcriptions of what you here and traslation below, exactly two sections, updated incrementally:\n" +
+              "MIC TURN.\n" +
+              "Output NOTHING until speech is detected.\n" +
+              "When speech is detected, stream ONLY:\n" +
               "Transcript: <partial transcript>\n" +
-              "Translation: <partial translation>\n"
+              "Translation: <partial translation>\n" +
+              "NEVER output generic chat during mic turn."
           }
         }));
 
-        micBtn.textContent = "Stop Mic";
-        statusEl.textContent = "🎙️ Mic ON — speaking will appear below.";
-      } catch (err) {
-        console.error(err);
-        statusEl.textContent = "Mic error: " + String(err);
+        micBtn.textContent = "Stop Mic"; statusEl.textContent = "🎙️ Mic ON — streaming…";
+      } catch (e) {
+        console.error(e); statusEl.textContent = "Mic error.";
         try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch {}
-        micActive = false;
-        micBtn.textContent = "Start Mic";
-      } finally {
-        micBtn.disabled = false;
-      }
+        micActive = false; micBtn.textContent = "Start Mic";
+      } finally { micBtn.disabled = false; }
     }
 
-    async function stopMic() {
-      // MIC -> SILENT (no renegotiation)
-      try {
-        if (audioTransceiver && audioTransceiver.sender) {
-          await audioTransceiver.sender.replaceTrack(silentTrack || null);
-        }
-      } catch {}
+    async function stopMic(quiet=false) {
+      try { if (audioTransceiver && audioTransceiver.sender) await audioTransceiver.sender.replaceTrack(silentTrack || null); } catch {}
       try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch {}
-
-      micActive = false;
+      micActive = false; micGuardArmed = false; micBuffer = "";
       micBtn.textContent = "Start Mic";
-      statusEl.textContent = "Mic OFF — requesting suggestions…";
+      statusEl.textContent = quiet ? "Mic paused for chat." : "Mic OFF — getting suggestions…";
+      if (quiet) return;
 
-      if (dc && dc.readyState === "open") {
-        addBubble("assistant", ""); // separate bubble for suggestions
-        dc.send(JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["text"],
-            instructions:
-              "Now that the speech turn is over, recommend some reply suggestions to the previous inputs that were just transcribed and translated. ONLY the suggestions in BOTH languages, formatted EXACTLY:\n\n" +
-              "Suggestions (target language):\n• <reply 1>\n• <reply 2>\n\n" +
-              "Suggestions (same but in source language):\n• <reply 1>\n• <reply 2>"
-          }
-        }));
+      try {
+        const r = await fetch("/api/mic-stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ transcript: liveTranscript.trim(), history })
+        });
+        const data = await r.json();
+        addBubble("assistant", data.suggestions || "(no suggestions)");
+        history.push({ role: "assistant", content: data.suggestions || "" });
+        statusEl.textContent = "Ready.";
+      } catch (e) {
+        console.error(e); addBubble("assistant", "(suggestions error)"); statusEl.textContent = "Error.";
       }
     }
   </script>
