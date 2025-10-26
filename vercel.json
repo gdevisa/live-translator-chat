@@ -1,11 +1,11 @@
 {
   "framework": null,
   "builds": [
-    { "src": "api/realtime.ts", "use": "@vercel/node" },
+    { "src": "api/realtime.js", "use": "@vercel/node" },
     { "src": "public/**", "use": "@vercel/static" }
   ],
   "routes": [
-    { "src": "/api/realtime", "dest": "/api/realtime.ts" },
+    { "src": "/api/realtime", "dest": "/api/realtime.js" },
     { "src": "/(.*)", "dest": "/public/$1" }
   ]
 }
