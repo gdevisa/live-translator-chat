@@ -1,6 +1,22 @@
-// api/mic-stop.mjs
-import { createChatAgent } from "../agents/chatAgent.mjs";
-const chatAgent = createChatAgent();
+// api/mic-stop.mjs (Agents SDK version)
+import { Agent, run } from "@openai/agents";
+
+const chatAgent = new Agent({
+  name: "ChatAgent",
+  model: process.env.LLM_MODEL || "gpt-4o",
+  instructions: [
+    "You are a helpful assistant.",
+    "Use prior conversation context.",
+    "When asked for suggestions after a mic turn, output EXACTLY the two sections below.",
+    "Do not add extra prose."
+  ].join("\n")
+});
+
+function historyToPrompt(messages = []) {
+  return messages
+    .map(m => `${m.role.toUpperCase()}: ${m.content}`)
+    .join("\n");
+}
 
 export default async function handler(req, res) {
   try {
@@ -13,7 +29,9 @@ export default async function handler(req, res) {
     }
     if (model) chatAgent.model = model;
 
+    const context = Array.isArray(history) ? historyToPrompt(history) : "";
     const prompt = [
+      context && `CONTEXT\n${context}\n---`,
       "Mic turn ended. Based on prior context and the transcript below, output EXACTLY:",
       "",
       "Suggestions (target):",
@@ -28,10 +46,8 @@ export default async function handler(req, res) {
       `Transcript:\n${transcript}`
     ].filter(Boolean).join("\n");
 
-    const messages = Array.isArray(history) ? [...history, { role: "user", content: prompt }] : [{ role: "user", content: prompt }];
-
-    const result = await chatAgent.run(messages);
-    res.status(200).json({ suggestions: result.outputText() });
+    const result = await run(chatAgent, prompt);
+    res.status(200).json({ suggestions: result.finalOutput || "" });
   } catch (e) {
     console.error("mic-stop error:", e);
     res.status(500).json({ error: "handoff_failed", details: String(e) });

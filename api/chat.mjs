@@ -1,6 +1,23 @@
-// api/chat.mjs
-import { createChatAgent } from "../agents/chatAgent.mjs";
-const chatAgent = createChatAgent();
+// api/chat.mjs (Agents SDK version)
+import { Agent, run } from "@openai/agents";
+
+const chatAgent = new Agent({
+  name: "ChatAgent",
+  model: process.env.LLM_MODEL || "gpt-4o",
+  instructions: [
+    "You are a helpful assistant.",
+    "Use prior conversation context.",
+    "For normal typed chat, NEVER include 'Transcript:' or 'Translation:'.",
+    "Be concise and polite."
+  ].join("\n")
+});
+
+// Simple converter: ChatML-style history -> one prompt string
+function historyToPrompt(messages = []) {
+  return messages
+    .map(m => `${m.role.toUpperCase()}: ${m.content}`)
+    .join("\n");
+}
 
 export default async function handler(req, res) {
   try {
@@ -12,8 +29,10 @@ export default async function handler(req, res) {
     }
     if (model) chatAgent.model = model;
 
-    const result = await chatAgent.run(messages);
-    res.status(200).json({ text: result.outputText() });
+    const prompt = historyToPrompt(messages);
+    const result = await run(chatAgent, prompt);
+
+    res.status(200).json({ text: result.finalOutput || "" });
   } catch (e) {
     console.error("chat error:", e);
     res.status(500).json({ error: "chat_failed", details: String(e) });
