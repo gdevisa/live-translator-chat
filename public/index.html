@@ -3,12 +3,13 @@
 <head>
   <meta charset="utf-8" />
   <title>Live Translator Chat</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { --bg:#fff; --fg:#111; --muted:#777; --bubble:#f7f7f7; --bubbleMe:#eaf1ff; }
     body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--fg); }
-    .wrap { max-width: 820px; margin: 0 auto; padding: 24px; }
+    .wrap { max-width: 880px; margin: 0 auto; padding: 24px; }
     h2 { margin: 0 0 12px; }
-    #chat { border:1px solid #ddd; border-radius:12px; padding:14px; min-height:360px; display:flex; flex-direction:column; gap:8px; overflow:auto; }
+    #chat { border:1px solid #ddd; border-radius:12px; padding:14px; min-height:380px; display:flex; flex-direction:column; gap:8px; overflow:auto; }
     .bubble { padding:10px 12px; border-radius:12px; max-width: 80%; white-space:pre-wrap; line-height:1.35; }
     .me { align-self:flex-end; background:var(--bubbleMe); }
     .ai { align-self:flex-start; background:var(--bubble); }
@@ -18,200 +19,277 @@
     button:active { transform: translateY(1px); }
     #status { margin-top:10px; color:var(--muted); font-size:13px; }
     .small { font-size:12px; color:var(--muted); }
-    code { background:#f2f2f2; padding:2px 6px; border-radius:6px; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h2>🎧 Live Translator Chat</h2>
+
     <div id="chat"></div>
 
     <div class="row">
-      <input id="text" placeholder="Type context or chat (e.g., 'I’m learning Spanish for travel. Please translate to English.')" />
+      <input id="text" placeholder="Type context or chat (e.g., 'I’m practicing Spanish; translate my speech to English.')" />
       <button id="send">Send</button>
       <button id="mic">Start Mic</button>
     </div>
+
     <div id="status">Ready.</div>
     <p class="small">
-      While the mic is on: transcript + translation stream in this chat.<br/>
-      When you stop: you'll receive <b>suggested replies</b> in target & source languages.
+      Type a message first to set context (the model replies).<br/>
+      Then press <b>Start Mic</b> — you’ll see <em>Transcript</em> and <em>Translation</em> streaming.<br/>
+      When you stop, you’ll get <b>Suggestions</b> in target &amp; source languages.
     </p>
   </div>
 
   <script>
-    const MODEL = "gpt-4o-realtime-preview"; // adjust if needed
+    // ===== Config =====
+    const MODEL = "gpt-4o-realtime-preview";   // Realtime model
 
-    const chat = document.getElementById("chat");
-    const text = document.getElementById("text");
-    const send = document.getElementById("send");
-    const micBtn = document.getElementById("mic");
+    // ===== DOM =====
+    const chat     = document.getElementById("chat");
+    const text     = document.getElementById("text");
+    const sendBtn  = document.getElementById("send");
+    const micBtn   = document.getElementById("mic");
     const statusEl = document.getElementById("status");
 
-    let pc, dc, micStream, started = false;
+    // ===== RTC / Realtime session state =====
+    let pc, dc, micStream;
+    let sessionOpen = false;
+    let micActive = false;
 
+    // Queue of messages typed before the session exists
+    const pendingContext = [];
+
+    // ===== Helpers =====
     function addBubble(role, msg, replaceLast=false) {
-        if (replaceLast) {
-          const last = chat.lastElementChild;
-          if (last && last.dataset.role === role) {
-            last.textContent = msg;
-            chat.scrollTop = chat.scrollHeight;
-            return last;
-          }
+      if (replaceLast) {
+        const last = chat.lastElementChild;
+        if (last && last.dataset.role === role) {
+          last.textContent = msg;
+          chat.scrollTop = chat.scrollHeight;
+          return last;
         }
-        const div = document.createElement("div");
-        div.className = "bubble " + (role === "user" ? "me" : "ai");
-        div.dataset.role = role;
-        div.textContent = msg;
-        chat.appendChild(div);
-        chat.scrollTop = chat.scrollHeight;
-        return div;
       }
+      const div = document.createElement("div");
+      div.className = "bubble " + (role === "user" ? "me" : "ai");
+      div.dataset.role = role;
+      div.textContent = msg;
+      chat.appendChild(div);
+      chat.scrollTop = chat.scrollHeight;
+      return div;
+    }
 
-      async function start() {
-        micBtn.disabled = true;
-        statusEl.textContent = "Starting… (requesting mic & connecting)";
-        try {
-          console.log("[start] creating RTCPeerConnection");
-          pc = new RTCPeerConnection();
+    function latestAssistantBubble() {
+      const els = Array.from(chat.children).filter(el => el.dataset.role === "assistant");
+      return els.at(-1) || null;
+    }
 
-          // Create data channel for events
-          dc = pc.createDataChannel("oai-events");
-          dc.onopen = () => {
-            console.log("[dc] open");
-            // Session instructions: live translate while mic is on
-            dc.send(JSON.stringify({
-              type: "session.update",
-              session: {
-                // text is default modality, but set explicitly to be safe
-                modalities: ["text"],
-                // server VAD helps model detect pauses/turns
-                turn_detection: { type: "server_vad" },
-                instructions:
-                  "You are a live translating assistant. While the mic is on, transcribe the user's speech " +
-                  "and translate it immediately using prior typed context. Be concise; while speaking, " +
-                  "output only transcript + translation. When the mic stops, provide TWO short suggested " +
-                  "replies in BOTH languages (target first, then source)."
-              }
-            }));
+    async function ensureConnection() {
+      if (sessionOpen) return;
 
-            // Replay visible chat as context
-            const items = Array.from(chat.children).map(el => {
-              const role = (el.dataset.role === "me") ? "user" : "assistant";
-              const text = el.textContent || "";
-              // Send existing messages as conversation items
-              return { type:"message", role, content:[{ type:"output_text", text }] };
-            });
-            for (const it of items) {
-              dc.send(JSON.stringify({ type: "conversation.item.create", item: it }));
-            }
+      console.log("[rtc] creating RTCPeerConnection");
+      pc = new RTCPeerConnection();
 
-            // Kick off a streaming response (so we get ongoing transcript/translation)
-            dc.send(JSON.stringify({
-              type: "response.create",
-              response: { modalities: ["text"] }
-            }));
+      dc = pc.createDataChannel("oai-events");
+      dc.onopen = () => {
+        sessionOpen = true;
+        console.log("[dc] open");
 
-            console.log("[dc] session.update & response.create sent");
-          };
-
-          dc.onclose = () => console.log("[dc] close");
-          dc.onerror  = (e) => console.error("[dc] error", e);
-
-          // Log ALL events; also render text deltas from multiple possible event names
-          dc.onmessage = (e) => {
-            try {
-              const ev = JSON.parse(e.data);
-              // Always log the raw event type for debugging
-              console.log("[dc] event:", ev.type, ev);
-
-              // Unified handler for text streaming:
-              // Some versions use response.output_text.delta; others: response.text.delta
-              if (ev.type === "response.output_text.delta" || ev.type === "response.text.delta") {
-                let last = chat.lastElementChild;
-                if (!last || last.dataset.role !== "assistant") last = addBubble("assistant", "");
-                last.textContent += ev.delta || "";
-                chat.scrollTop = chat.scrollHeight;
-                return;
-              }
-
-              // Optional: mark completion
-              if (ev.type === "response.completed" || ev.type === "response.done") {
-                console.log("[dc] response completed");
-                return;
-              }
-
-              // (You can add special-cases here for VAD events, e.g. speech_started/speech_stopped)
-            } catch (err) {
-              console.error("[dc] parse error", err, e.data);
-            }
-          };
-
-          pc.onconnectionstatechange = () => {
-            console.log("[pc] state:", pc.connectionState);
-            statusEl.textContent = "State: " + pc.connectionState;
-          };
-
-          // Mic
-          micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          pc.addTrack(micStream.getTracks()[0], micStream);
-          console.log("[start] mic track added");
-
-          // Offer → proxy → answer
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          console.log("[start] localDescription set; posting SDP to /api/realtime");
-          const resp = await fetch(`/api/realtime?model=gpt-4o-realtime-preview`, {
-            method: "POST",
-            headers: { "Content-Type": "application/sdp" },
-            body: offer.sdp
-          });
-          if (!resp.ok) {
-            const txt = await resp.text();
-            throw new Error(`Proxy /api/realtime failed: ${resp.status} ${txt}`);
+        // Session instructions: how to behave across the whole conversation
+        dc.send(JSON.stringify({
+          type: "session.update",
+          session: {
+            modalities: ["text"],
+            // let the server detect pauses/turns while mic is on
+            turn_detection: { type: "server_vad" },
+            instructions:
+              "You are a live translating assistant. Use prior typed messages as context. " +
+              "When the mic is ON, continuously stream ONLY the following two sections, updating them as new audio arrives:\n" +
+              "Transcript: <partial transcript>\n" +
+              "Translation: <partial translation>\n\n" +
+              "When the mic is OFF and I ask, output ONLY the suggestions in BOTH languages (target first, then source), " +
+              "formatted as:\n\n" +
+              "Suggestions (target):\n• …\n• …\n\n" +
+              "Suggestions (source):\n• …\n• …"
           }
-          const answer = { type: "answer", sdp: await resp.text() };
-          await pc.setRemoteDescription(answer);
-          console.log("[start] remoteDescription set; WebRTC established");
+        }));
 
-          addBubble("assistant", "…listening & translating…");
-          statusEl.textContent = "🎙️ Listening… press Stop to end turn.";
-          micBtn.textContent = "Stop Mic";
-          started = true;
+        // Replay visible chat so the model has full context
+        const items = Array.from(chat.children).map(el => {
+          const role = (el.dataset.role === "me") ? "user" : "assistant";
+          const t = el.textContent || "";
+          return { type:"message", role, content:[{ type:"output_text", text: t }] };
+        });
+        for (const it of items) {
+          dc.send(JSON.stringify({ type: "conversation.item.create", item: it }));
+        }
+
+        // Flush queued context typed before connection
+        for (const msg of pendingContext.splice(0)) {
+          dc.send(JSON.stringify({
+            type: "conversation.item.create",
+            item: { type:"message", role:"user", content:[{ type:"input_text", text: msg }] }
+          }));
+        }
+      };
+
+      dc.onclose = () => { console.log("[dc] close"); sessionOpen = false; };
+      dc.onerror  = (e) => console.error("[dc] error", e);
+
+      // Handle all server events (including text deltas)
+      dc.onmessage = (e) => {
+        try {
+          const ev = JSON.parse(e.data);
+          // Debug:
+          // console.log("[dc] event:", ev.type, ev);
+
+          // Streaming text deltas (names differ across versions)
+          if (ev.type === "response.output_text.delta" || ev.type === "response.text.delta") {
+            let last = latestAssistantBubble();
+            if (!last) last = addBubble("assistant", "");
+
+            // When mic is ON, we expect the two labeled sections
+            // The model is instructed to produce those, so we just append deltas.
+            last.textContent += ev.delta || "";
+            chat.scrollTop = chat.scrollHeight;
+            return;
+          }
+
+          if (ev.type === "response.completed" || ev.type === "response.done") {
+            // A single response finished streaming (we may start another later)
+            return;
+          }
+        } catch (err) {
+          console.error("[dc] parse error", err, e.data);
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        console.log("[pc] state:", pc.connectionState);
+        statusEl.textContent = "State: " + pc.connectionState;
+      };
+
+      // Create SDP offer *without* mic track (pure chat session for now)
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const resp = await fetch(`/api/realtime?model=${MODEL}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp" },
+        body: offer.sdp
+      });
+      if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(`Proxy /api/realtime failed: ${resp.status} ${txt}`);
+      }
+      const answer = { type: "answer", sdp: await resp.text() };
+      await pc.setRemoteDescription(answer);
+
+      console.log("[rtc] WebRTC data channel established");
+      statusEl.textContent = "Connected. You can chat or start mic.";
+    }
+
+    // ===== Text chat (context + normal Q/A) =====
+    sendBtn.onclick = async () => {
+      const msg = text.value.trim();
+      if (!msg) return;
+
+      addBubble("user", msg);
+      text.value = "";
+
+      // If not connected, queue this as context and open the session
+      if (!sessionOpen) {
+        pendingContext.push(msg);
+        try {
+          statusEl.textContent = "Connecting…";
+          await ensureConnection();
         } catch (err) {
           console.error(err);
           statusEl.textContent = "Error: " + String(err);
-          try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch {}
-          try { if (pc) pc.close(); } catch {}
-          started = false;
-          micBtn.textContent = "Start Mic";
-        } finally {
-          micBtn.disabled = false;
+          return;
         }
+      } else {
+        // Already connected: push into conversation immediately
+        dc.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: { type:"message", role:"user", content:[{ type:"input_text", text: msg }] }
+        }));
       }
 
-      async function stop() {
+      // Ask model to reply (useful to confirm context)
+      dc.send(JSON.stringify({
+        type: "response.create",
+        response: { modalities: ["text"] }
+      }));
+    };
+
+    // ===== Mic: start/stop live translation =====
+    micBtn.onclick = () => micActive ? stopMic() : startMic();
+
+    async function startMic() {
+      micBtn.disabled = true;
+      statusEl.textContent = "Starting mic…";
+
+      try {
+        // Ensure we have an active session first
+        if (!sessionOpen) {
+          await ensureConnection();
+        }
+
+        // Add mic track
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        pc.addTrack(micStream.getTracks()[0], micStream);
+        micActive = true;
+
+        // Start a streaming response for the live turn:
+        // We explicitly ask the model to stream only Transcript / Translation sections.
+        dc.send(JSON.stringify({
+          type: "response.create",
+          response: {
+            modalities: ["text"],
+            instructions:
+              "While the mic is on, stream updates with exactly two sections, updated incrementally:\n" +
+              "Transcript: <partial transcript>\n" +
+              "Translation: <partial translation>\n" +
+              "Do NOT include suggestions yet."
+          }
+        }));
+
+        micBtn.textContent = "Stop Mic";
+        statusEl.textContent = "🎙️ Mic ON — speaking will appear below.";
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = "Mic error: " + String(err);
         try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch {}
-        try { if (pc) pc.close(); } catch {}
-        // Ask for suggestions only as a follow-up
-        if (dc && dc.readyState === "open") {
-          dc.send(JSON.stringify({
-            type: "response.create",
-            response: {
-              modalities: ["text"],
-              instructions:
-                "Now that the speech turn is over, output ONLY the two short suggested replies in BOTH languages, " +
-                "formatted exactly as:\n\n" +
-                "Suggestions (<target_lang>):\n• …\n• …\n" +
-                "Suggestions (<source_lang>):\n• …\n• …"
-            }
-          }));
-        }
-        statusEl.textContent = "Turn ended.";
+        micActive = false;
         micBtn.textContent = "Start Mic";
-        started = false;
+      } finally {
+        micBtn.disabled = false;
       }
+    }
 
-      micBtn.onclick = () => (started ? stop() : start());
-    </script>
+    async function stopMic() {
+      try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch {}
+      micActive = false;
+      micBtn.textContent = "Start Mic";
+      statusEl.textContent = "Mic OFF — requesting suggestions…";
+
+      // Ask ONLY for suggestions (new message)
+      if (dc && dc.readyState === "open") {
+        // Create a fresh assistant bubble for suggestions (clean separation)
+        addBubble("assistant", "");
+
+        dc.send(JSON.stringify({
+          type: "response.create",
+          response: {
+            modalities: ["text"],
+            instructions:
+              "Now that the speech turn is over, output ONLY the suggestions in BOTH languages, formatted EXACTLY:\n\n" +
+              "Suggestions (target):\n• <short reply 1>\n• <short reply 2>\n\n" +
+              "Suggestions (source):\n• <short reply 1>\n• <short reply 2>"
+          }
+        }));
+      }
+    }
+  </script>
 </body>
 </html>
